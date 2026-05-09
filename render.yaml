@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: dirmom-v1
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    autoDeploy: true
+    envVars:
+      - key: PAPER_TRADING
+        value: "true"
+      - key: PAPER_EQUITY
+        value: "100000"
+      - key: NODE_ENV
+        value: production

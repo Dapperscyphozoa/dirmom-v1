@@ -1,0 +1,5 @@
+node_modules/
+dirmom-state.json
+dirmom-trades.json
+*.log
+.DS_Store
