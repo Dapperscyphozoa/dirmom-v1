@@ -263,7 +263,11 @@ async function handleTick({ paper = true, equity = 100000, hlClient = null } = {
       }
       
       if (isLive && hlClient && hlClient.placeOrder) {
-        try { await hlClient.placeOrder({ coin: cfg.hl, isBuy: dir === 1, sz: size, limit_px: sig.price, reduceOnly: false }); }
+        // Generate cloid + register with PM before placing
+        const cloid = `dirmom_${cfg.hl}_${ts}`;
+        try { await pm.registerCloid(cloid, cfg.hl); }
+        catch (e) { console.error('[dirmom] register_cloid err (non-fatal):', e.message); }
+        try { await hlClient.placeOrder({ coin: cfg.hl, isBuy: dir === 1, sz: size, limit_px: sig.price, reduceOnly: false, cloid }); }
         catch (e) { events.push({ ts, asset: sym, event: 'ERR_ORDER', msg: e.message }); continue; }
       }
       st.pos = dir; st.entryPx = sig.price; st.stop = sig.stop;

@@ -121,7 +121,19 @@ async function isPmLive() {
   return !!(r && r.status === 'ok');
 }
 
+async function registerCloid(cloid, coin, engine = ENGINE_NAME) {
+  if (!engine) return { ok: false, reason: 'ENGINE_NAME_unset' };
+  if (!cloid) return { ok: false, reason: 'cloid_empty' };
+  const body = { cloid: String(cloid), engine: String(engine) };
+  if (coin) body.coin = String(coin);
+  const r = await _request('POST', '/register_cloid', body);
+  if (!r) return { ok: false, reason: 'pm_unreachable' };
+  if (r._unreachable) return { ok: false, reason: 'pm_unreachable', error: r._error };
+  if (r._http_error) return { ok: false, reason: `pm_error_${r._http_error}` };
+  return r;
+}
+
 module.exports = {
-  getEquity, getRegime, getSizeFraction, checkPretrade, isPmLive,
+  getEquity, getRegime, getSizeFraction, checkPretrade, isPmLive, registerCloid,
   ENGINE_NAME, PM_URL, PM_CHECK_ENABLED,
 };
