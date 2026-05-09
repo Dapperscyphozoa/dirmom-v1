@@ -5,6 +5,7 @@
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const pm = require('./pm-client');
 
 // ============ LOCKED CONFIG (validated 180d backtest) ============
 const ASSETS = {
@@ -228,14 +229,49 @@ async function handleTick({ paper = true, equity = 100000, hlClient = null } = {
 
     if (sig.action === 'open_long' || sig.action === 'open_short') {
       const dir = sig.action === 'open_long' ? 1 : -1;
-      const size = calcSize(curEquity, cfg.alloc, sig.price, sig.stop);
-      if (!paper && hlClient && hlClient.placeOrder) {
+      const isLive = !paper;
+      
+      // Pull live size_fraction from PM (lifecycle stage). Paper engines: 1.0.
+      // Fail-closed: if PM unreachable, getSizeFraction returns 0.0 → skip.
+      const sizeFraction = isLive ? await pm.getSizeFraction() : 1.0;
+      if (isLive && sizeFraction <= 0) {
+        events.push({ ts, asset: sym, event: 'SKIP_PM_SIZE_ZERO',
+                       reason: 'pm_size_fraction_zero_or_unreachable' });
+        continue;
+      }
+      
+      const baseSize = calcSize(curEquity, cfg.alloc, sig.price, sig.stop);
+      const size = baseSize * sizeFraction;
+      const notional = size * sig.price;
+      
+      if (notional < 10) {
+        events.push({ ts, asset: sym, event: 'SKIP_NOTIONAL_TOO_SMALL',
+                       size, notional, sizeFraction });
+        continue;
+      }
+      
+      // Pre-trade gate (fail-closed if PM unreachable when PM_CHECK_ENABLED=1)
+      const slDistPct = Math.abs(sig.price - sig.stop) / sig.price;
+      const pmCheck = await pm.checkPretrade({
+        coin: cfg.hl, side: dir === 1 ? 'B' : 'A',
+        notional, slDistancePct: slDistPct, isLive,
+      });
+      if (!pmCheck.allow) {
+        events.push({ ts, asset: sym, event: 'DENIED_BY_PM',
+                       reason: pmCheck.reason, pm_check: pmCheck });
+        continue;
+      }
+      
+      if (isLive && hlClient && hlClient.placeOrder) {
         try { await hlClient.placeOrder({ coin: cfg.hl, isBuy: dir === 1, sz: size, limit_px: sig.price, reduceOnly: false }); }
         catch (e) { events.push({ ts, asset: sym, event: 'ERR_ORDER', msg: e.message }); continue; }
       }
       st.pos = dir; st.entryPx = sig.price; st.stop = sig.stop;
       st.entryTs = ts; st.size = size; st.openPnl = 0;
-      events.push({ ts, asset: sym, event: sig.action.toUpperCase(), price: sig.price, stop: sig.stop, size: +size.toFixed(6), reason: sig.reason });
+      events.push({ ts, asset: sym, event: sig.action.toUpperCase(),
+                     price: sig.price, stop: sig.stop, size: +size.toFixed(6),
+                     reason: sig.reason, pm_size_fraction: sizeFraction,
+                     pm_capital_remaining: pmCheck.capital_remaining });
     } else if (sig.action === 'close' && st.pos !== 0) {
       if (!paper && hlClient && hlClient.closePosition) {
         try { await hlClient.closePosition({ coin: cfg.hl }); }
