@@ -18,8 +18,10 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
-const { handleTick, getState, getSignals, getTrades, ASSETS, INTERVAL_SECONDS } =
-  require('./engine');
+const { handleTick, getState, getSignals, getTrades,
+        refreshUniverse, getAssets, getUniverseRefreshTs,
+        USE_FULL_UNIVERSE, UNIVERSE_REFRESH_MS, blacklist,
+        INTERVAL_SECONDS } = require('./engine');
 
 const PORT = process.env.PORT || 3000;
 const PAPER = process.env.PAPER_TRADING !== 'false';  // default paper
@@ -44,7 +46,41 @@ app.get('/health', (_req, res) => {
   });
 });
 
-app.get('/state', (_req, res) => res.json(getState()));
+app.get('/state', (_req, res) => {
+  const s = getState();
+  const assets = getAssets();
+  const bl = blacklist.getStateSnapshot();
+  res.json({
+    ...s,
+    universe: {
+      use_full_universe: USE_FULL_UNIVERSE,
+      size: Object.keys(assets).length,
+      coins: Object.keys(assets).sort(),
+      last_refresh_ts: getUniverseRefreshTs(),
+    },
+    blacklist: bl,
+  });
+});
+
+app.get('/universe', (_req, res) => {
+  const assets = getAssets();
+  res.json({
+    use_full_universe: USE_FULL_UNIVERSE,
+    size: Object.keys(assets).length,
+    coins: Object.keys(assets).sort(),
+    blacklisted: blacklist.getBlacklisted(),
+    consec_losses: blacklist.getConsecLosses(),
+    last_refresh_ts: getUniverseRefreshTs(),
+  });
+});
+
+app.get('/blacklist', (_req, res) => res.json(blacklist.getStateSnapshot()));
+
+app.post('/blacklist/reset', express.json(), (req, res) => {
+  const coin = req.body && req.body.coin;
+  if (coin) { blacklist.resetCoin(coin); res.json({ reset: coin }); }
+  else { blacklist.resetAll(); res.json({ reset: 'all' }); }
+});
 app.get('/signals', (_req, res) => res.json(getSignals()));
 app.get('/trades', (_req, res) => res.json(getTrades()));
 
@@ -126,7 +162,7 @@ app.get('/', (_req, res) => {
 </div>
 <div class="panel">
   <h3 style="color:#0ff;margin-top:0">CONFIG</h3>
-  <pre style="color:#0f0;margin:0">${JSON.stringify(ASSETS, null, 2)}</pre>
+  <pre style="color:#0f0;margin:0">${JSON.stringify({ size: Object.keys(getAssets()).length, sample: Object.keys(getAssets()).slice(0, 20), blacklisted: blacklist.getBlacklisted() }, null, 2)}</pre>
 </div>
 <p style="color:#444;font-size:11px;margin-top:30px">last tick: ${s.lastTickTs || 'never'} · poll: every ${INTERVAL_SECONDS}s · auto-refresh: 30s</p>
 </body></html>`);
@@ -143,9 +179,13 @@ async function tickLoop() {
   }
 }
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`DIRECTIONAL MOMENTUM V1 listening on :${PORT} (mode=${PAPER ? 'PAPER' : 'LIVE'}, paper_equity=$${PAPER_EQUITY})`);
-  // first tick immediately, then on interval
+  console.log(`  use_full_universe=${USE_FULL_UNIVERSE} blacklist_threshold=${blacklist.THRESHOLD}`);
+  // Populate ASSETS from HL meta (or fall back to curated trio) before first tick
+  const n = await refreshUniverse();
+  console.log(`  active universe: ${n} assets`);
   tickLoop();
   setInterval(tickLoop, INTERVAL_SECONDS * 1000);
+  setInterval(refreshUniverse, UNIVERSE_REFRESH_MS);
 });
