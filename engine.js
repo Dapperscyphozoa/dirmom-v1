@@ -6,13 +6,93 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const pm = require('./pm-client');
+const blacklist = require('./blacklist');
 
-// ============ LOCKED CONFIG (validated 180d backtest) ============
-const ASSETS = {
-  'SOL': { okx: 'SOL-USDT-SWAP', hl: 'SOL', fast: 48, slow: 288, trailAtr: 1.5, alloc: 0.40 },
-  'LINK': { okx: 'LINK-USDT-SWAP', hl: 'LINK', fast: 72, slow: 432, trailAtr: 2.0, alloc: 0.35 },
-  'ETH': { okx: 'ETH-USDT-SWAP', hl: 'ETH', fast: 72, slow: 432, trailAtr: 2.0, alloc: 0.25 },
+const USE_FULL_UNIVERSE = process.env.USE_FULL_UNIVERSE !== '0';  // default ON
+const UNIVERSE_REFRESH_MS = parseInt(process.env.UNIVERSE_REFRESH_SEC || '3600', 10) * 1000;
+let _universeLastRefreshTs = 0;
+
+// ============ ASSET CONFIG ============
+// Originally tuned trio (validated 180d backtest, Sharpe 3.22) — kept as the
+// reference params for the curated coins. New coins added via HL universe
+// expansion get DEFAULT_PARAMS (ETH-style: fast 72, slow 432, trail 2.0).
+const REFERENCE_ASSETS = {
+  'SOL':  { okx: 'SOL-USDT-SWAP',  hl: 'SOL',  fast: 48, slow: 288, trailAtr: 1.5 },
+  'LINK': { okx: 'LINK-USDT-SWAP', hl: 'LINK', fast: 72, slow: 432, trailAtr: 2.0 },
+  'ETH':  { okx: 'ETH-USDT-SWAP',  hl: 'ETH',  fast: 72, slow: 432, trailAtr: 2.0 },
 };
+const DEFAULT_PARAMS = { fast: 72, slow: 432, trailAtr: 2.0 };
+
+// ASSETS is mutable — populated on startup from HL universe (or falls back to
+// REFERENCE_ASSETS if USE_FULL_UNIVERSE=0 or HL fetch fails).
+let ASSETS = {};
+
+function _hlMeta() {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ type: 'meta' });
+    const req = https.request({
+      hostname: 'api.hyperliquid.xyz', path: '/info', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': body.length },
+      timeout: 15000,
+    }, (res) => {
+      let data = '';
+      res.on('data', (c) => (data += c));
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch (e) { reject(e); } });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('hl meta timeout')); });
+    req.write(body); req.end();
+  });
+}
+
+async function refreshUniverse() {
+  if (!USE_FULL_UNIVERSE) {
+    // Curated mode: use the validated trio with original allocs
+    ASSETS = {
+      'SOL':  { ...REFERENCE_ASSETS.SOL,  alloc: 0.40 },
+      'LINK': { ...REFERENCE_ASSETS.LINK, alloc: 0.35 },
+      'ETH':  { ...REFERENCE_ASSETS.ETH,  alloc: 0.25 },
+    };
+    _universeLastRefreshTs = Date.now();
+    console.log(`[universe] curated mode: ${Object.keys(ASSETS).length} assets`);
+    return Object.keys(ASSETS).length;
+  }
+  try {
+    const meta = await _hlMeta();
+    if (!meta || !Array.isArray(meta.universe) || meta.universe.length === 0) {
+      throw new Error('bad meta response');
+    }
+    const names = meta.universe.map((u) => u && u.name).filter((n) => typeof n === 'string');
+    const next = {};
+    const allocPer = 1.0 / names.length;
+    for (const name of names) {
+      const ref = REFERENCE_ASSETS[name];
+      const params = ref || DEFAULT_PARAMS;
+      next[name] = {
+        okx: `${name}-USDT-SWAP`,
+        hl: name,
+        fast: params.fast,
+        slow: params.slow,
+        trailAtr: params.trailAtr,
+        alloc: allocPer,
+      };
+    }
+    ASSETS = next;
+    _universeLastRefreshTs = Date.now();
+    console.log(`[universe] refreshed: ${names.length} HL perps (alloc=${(allocPer*100).toFixed(2)}% each)`);
+    return names.length;
+  } catch (e) {
+    console.error(`[universe] refresh failed: ${e.message}; falling back to curated trio`);
+    if (Object.keys(ASSETS).length === 0) {
+      ASSETS = {
+        'SOL':  { ...REFERENCE_ASSETS.SOL,  alloc: 0.40 },
+        'LINK': { ...REFERENCE_ASSETS.LINK, alloc: 0.35 },
+        'ETH':  { ...REFERENCE_ASSETS.ETH,  alloc: 0.25 },
+      };
+    }
+    return Object.keys(ASSETS).length;
+  }
+}
 const ATR_N = 48;
 const FEES_BPS = 4.5;
 const SLIPPAGE_BPS = 2.0;
@@ -223,11 +303,17 @@ async function handleTick({ paper = true, equity = 100000, hlClient = null } = {
   }
   _state.equity = curEquity;
 
-  // per-asset
+  // per-asset (skip blacklisted; ensure position record exists for new coins)
+  const blSet = new Set(blacklist.getBlacklisted());
   for (const [sym, cfg] of Object.entries(ASSETS)) {
+    if (blSet.has(sym)) continue;
+    if (!_state.positions[sym]) {
+      _state.positions[sym] = { pos: 0, stop: null, entryPx: null, entryTs: null, openPnl: 0, size: 0 };
+    }
     let bars;
     try { bars = await fetchKlines(cfg.okx, 30); }
     catch (e) {
+      // OKX won't have every HL coin (esp newer perps) — skip silently for those
       events.push({ ts, asset: sym, event: 'ERR_FETCH', msg: e.message });
       continue;
     }
@@ -304,6 +390,8 @@ async function handleTick({ paper = true, equity = 100000, hlClient = null } = {
         reason: sig.reason,
       };
       _trades.push(trade);
+      try { blacklist.recordOutcome(sym, realizedPct * 100, sig.reason); }
+      catch (e) { console.error(`[blacklist] hook failed for ${sym}: ${e.message}`); }
       events.push({ ts, asset: sym, event: 'CLOSE', price: sig.price, realizedPct: +(realizedPct*100).toFixed(3), reason: sig.reason });
       st.pos = 0; st.entryPx = null; st.stop = null; st.entryTs = null; st.openPnl = 0; st.size = 0;
     } else if (sig.action === 'hold' && st.pos !== 0) {
@@ -327,9 +415,14 @@ module.exports = {
   getState,
   getSignals,
   getTrades,
-  ASSETS,
+  refreshUniverse,
+  getAssets: () => ASSETS,
+  getUniverseRefreshTs: () => _universeLastRefreshTs,
   ATR_N,
   INTERVAL_SECONDS,
+  USE_FULL_UNIVERSE,
+  UNIVERSE_REFRESH_MS,
+  blacklist,
   // exports for testing
   fetchKlines,
   ema,
