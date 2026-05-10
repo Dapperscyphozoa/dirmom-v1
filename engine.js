@@ -179,6 +179,14 @@ function saveTrades(t) { try { fs.writeFileSync(TRADES_FILE, JSON.stringify(t, n
 
 // ============ SIZING ============
 function calcSize(equity, alloc, entryPx, stopPx) {
+  // Fixed-notional override (env: FIXED_NOTIONAL_USD). When > 0, returns
+  // size such that size × entryPx = FIXED_NOTIONAL_USD, ignoring risk_pct,
+  // alloc, and stop distance. Read on each call so Render env edits apply
+  // without restart.
+  const fixedNtl = parseFloat(process.env.FIXED_NOTIONAL_USD || '0');
+  if (fixedNtl > 0 && entryPx > 0) {
+    return fixedNtl / entryPx;
+  }
   const capRisk = equity * alloc * RISK_PCT;
   const pxRisk = Math.abs(entryPx - stopPx);
   if (pxRisk <= 0 || entryPx <= 0) return 0;
