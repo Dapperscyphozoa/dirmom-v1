@@ -29,6 +29,14 @@ const PAPER_EQUITY = parseFloat(process.env.PAPER_EQUITY || '100000');
 
 const app = express();
 app.use(express.json());
+// CORS for dashboard fetches (browser blocks JSON loads without these headers).
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Halt-Token');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 app.use((req, _res, next) => { console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`); next(); });
 
 app.get('/health', (_req, res) => {
